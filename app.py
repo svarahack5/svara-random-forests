@@ -6,113 +6,122 @@ from flask import Flask, request, jsonify, render_template_string
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score
 
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. MODEL & DATASET MANAGEMENT WITH PIPELINE
+# 1. MODEL & DATASET MANAGEMENT (REAL DATASET + NON-CLINICAL FAQS)
 # ==============================================================================
-MODEL_FILE = os.path.join(os.path.dirname(__file__), 'model_pipeline.joblib')
-DATASET_FILE = 'dementia_multi_stage_dataset.csv'
+MODEL_FILE = os.path.join(os.path.dirname(__file__), 'dementia_real_model.joblib')
+DATASET_FILE = 'dementia_dataset.csv'
 
+# Non-clinical feature keys corresponding to daily life FAQ inputs
 FEATURE_KEYS = [
-    'age', 'speech_find_words', 'memory_recent_events', 'memory_repeat_questions',
-    'orientation_date_time', 'orientation_familiar_places', 'tasks_managing_money',
-    'tasks_using_appliances', 'tasks_cooking_meals', 'mood_unmotivated_apathy',
-    'mood_anxiety_agitation', 'mood_personality_change', 'motor_misplacing_items',
-    'motor_trouble_dressing', 'sleep_restlessness', 'social_withdrawal',
-    'safety_wandering', 'judgment_poor_decisions'
+    'age',
+    'daily_faq_memory_conversations',     # Maps to MMSE recall
+    'daily_faq_orientation_time_date',    # Maps to MMSE time orientation
+    'daily_faq_navigating_places',        # Maps to MMSE spatial orientation
+    'daily_faq_managing_finances',        # Maps to EDUC / MMSE calculation
+    'daily_faq_household_chores',         # Maps to MMSE execution
+    'daily_faq_learning_new_tasks',       # Maps to SES / EDUC adaptation
+    'daily_faq_language_word_finding',    # Maps to MMSE language
+    'daily_faq_object_misplacement',      # Maps to brain atrophy / nWBV surrogate
+    'daily_faq_decision_making'           # Maps to eTIV / CDR impairment degree
 ]
 
 
-def generate_multi_stage_dataset():
-    """Generates a synthetic dataset with 18 self-assessment parameters and 4 dementia stages."""
-    np.random.seed(42)
-    n_samples = 3000
+def prepare_real_dataset():
+    """Loads dementia_dataset.csv and maps clinical columns to non-clinical daily life FAQ proxies."""
+    if not os.path.exists(DATASET_FILE):
+        raise FileNotFoundError(f"Dataset file '{DATASET_FILE}' not found. Please place it in the application directory.")
 
-    data = {'age': np.random.randint(50, 96, n_samples)}
+    raw_df = pd.read_csv(DATASET_FILE)
 
-    for feat in FEATURE_KEYS[1:]:
-        data[feat] = np.random.choice([0.0, 0.5, 1.0], size=n_samples, p=[0.55, 0.30, 0.15])
+    # Clean target column CDR (Clinical Dementia Rating)
+    # Mapping: 0.0 -> Stage 0 (Normal), 0.5 -> Stage 1 (Mild), 1.0 -> Stage 2 (Moderate), 2.0+ -> Stage 3 (Advanced)
+    raw_df = raw_df.dropna(subset=['CDR']).copy()
 
-    df = pd.DataFrame(data)
-
-    weighted_score = (
-        (df['age'] > 75).astype(int) * 1.5 +
-        df['speech_find_words'] * 1.5 +
-        df['memory_recent_events'] * 2.0 +
-        df['memory_repeat_questions'] * 1.5 +
-        df['orientation_date_time'] * 2.0 +
-        df['orientation_familiar_places'] * 2.5 +
-        df['tasks_managing_money'] * 2.0 +
-        df['tasks_using_appliances'] * 1.5 +
-        df['tasks_cooking_meals'] * 1.5 +
-        df['mood_unmotivated_apathy'] * 1.0 +
-        df['mood_anxiety_agitation'] * 1.0 +
-        df['mood_personality_change'] * 1.5 +
-        df['motor_misplacing_items'] * 1.0 +
-        df['motor_trouble_dressing'] * 2.5 +
-        df['sleep_restlessness'] * 1.0 +
-        df['social_withdrawal'] * 1.0 +
-        df['safety_wandering'] * 3.0 +
-        df['judgment_poor_decisions'] * 1.5
-    )
-
-    def calculate_stage(score):
-        if score < 5.0:
+    def map_cdr_to_stage(cdr):
+        if cdr == 0.0:
             return 0
-        elif score < 12.0:
+        elif cdr == 0.5:
             return 1
-        elif score < 20.0:
+        elif cdr == 1.0:
             return 2
         else:
             return 3
 
-    df['stage'] = weighted_score.apply(calculate_stage)
-    df.to_csv(DATASET_FILE, index=False)
-    return df
+    mapped_df = pd.DataFrame()
+    mapped_df['stage'] = raw_df['CDR'].apply(map_cdr_to_stage)
+
+    # Base Age
+    mapped_df['age'] = raw_df['Age'].values
+
+    # MMSE score inverted scale (Lower MMSE = higher difficulty severity)
+    mmse = raw_df['MMSE'].fillna(raw_df['MMSE'].median())
+    mmse_severity = np.clip((30.0 - mmse) / 15.0, 0.0, 1.0)
+
+    # Brain Atrophy / Volume metrics (nWBV, eTIV) mapped as daily fatigue / misplacement surrogates
+    nwbv = raw_df['nWBV'].fillna(raw_df['nWBV'].median())
+    nwbv_severity = np.clip((0.85 - nwbv) / 0.20, 0.0, 1.0)
+
+    # Mapping non-clinical daily life FAQ proxy scores (0.0 = Normal, 0.5 = Mild, 1.0 = Frequent)
+    mapped_df['daily_faq_memory_conversations'] = np.round(mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_orientation_time_date'] = np.round(mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_navigating_places'] = np.round(mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_managing_finances'] = np.round(((30.0 - mmse) + (18 - raw_df['EDUC'].fillna(12))) / 30.0 * 2) / 2.0
+    mapped_df['daily_faq_managing_finances'] = np.clip(mapped_df['daily_faq_managing_finances'], 0.0, 1.0)
+
+    mapped_df['daily_faq_household_chores'] = np.round(mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_learning_new_tasks'] = np.round((raw_df['SES'].fillna(3) / 5.0) * mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_learning_new_tasks'] = np.clip(mapped_df['daily_faq_learning_new_tasks'], 0.0, 1.0)
+
+    mapped_df['daily_faq_language_word_finding'] = np.round(mmse_severity * 2) / 2.0
+    mapped_df['daily_faq_object_misplacement'] = np.round(nwbv_severity * 2) / 2.0
+    mapped_df['daily_faq_object_misplacement'] = np.clip(mapped_df['daily_faq_object_misplacement'], 0.0, 1.0)
+
+    mapped_df['daily_faq_decision_making'] = np.round(mmse_severity * 2) / 2.0
+
+    return mapped_df
 
 
 def load_or_train_model():
-    """Loads a pre-trained pipeline model if present; otherwise generates data, validates, and trains."""
+    """Trains a pipeline model on dementia_dataset.csv with leak-prevention train-test splitting."""
     if os.path.exists(MODEL_FILE):
         print(f"Loading existing model pipeline from {MODEL_FILE}...")
         return joblib.load(MODEL_FILE)
 
-    print("No joblib model found. Generating synthetic dataset and training pipeline...")
-    if not os.path.exists(DATASET_FILE):
-        df = generate_multi_stage_dataset()
-    else:
-        df = pd.read_csv(DATASET_FILE)
+    print("Loading real dementia dataset and building training pipeline...")
+    df = prepare_real_dataset()
 
     X = df[FEATURE_KEYS]
     y = df['stage']
 
-    # 1. Train-test split with stratification to prevent data leakage and evaluate safely
+    # 1. Stratified Train-Test Split to avoid data leakage
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # 2. Define Pipeline combining preprocessing and classifier
+    # 2. Pipeline combining imputer and random forest classifier
     pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42))
+        ('imputer', SimpleImputer(strategy='median')),
+        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=15, random_state=42))
     ])
 
-    # Train on training split
+    # Train on training split only
     pipeline.fit(X_train, y_train)
 
-    # Evaluate on test split
+    # Validate model on separate test split
     y_pred = pipeline.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    print(f"Model Pipeline trained successfully! Test Accuracy: {acc * 100:.2f}%")
+    print(f"Real Dataset Pipeline trained successfully! Test Accuracy: {acc * 100:.2f}%")
 
-    # Retrain on full dataset for production deployment
+    # Fit full pipeline for deployment
     pipeline.fit(X, y)
 
-    # Save pipeline locally
+    # Save trained pipeline locally
     try:
         joblib.dump(pipeline, MODEL_FILE)
         print(f"Model pipeline saved to {MODEL_FILE}")
@@ -125,7 +134,7 @@ def load_or_train_model():
 model = load_or_train_model()
 
 # ==============================================================================
-# 2. SENIOR-FRIENDLY EMBEDDED HTML, CSS, AND JS INTERFACE
+# 2. NON-CLINICAL DAILY LIFE INTERFACE (HTML, CSS, JS)
 # ==============================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -134,7 +143,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#0e0a17">
-    <title>Dementia Stage Analysis</title>
+    <title>Daily Living & Cognitive Assessment</title>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
 
     <style>
@@ -338,10 +347,6 @@ HTML_TEMPLATE = """
             box-shadow: 0 12px 28px rgba(125, 85, 214, .5);
         }
 
-        .btn-submit:active {
-            transform: translateY(0);
-        }
-
         .result-card {
             display: none;
             margin-top: 40px;
@@ -402,10 +407,6 @@ HTML_TEMPLATE = """
             input[type="number"], select { font-size: 15px; }
             .btn-submit { font-size: 18px; }
         }
-
-        @media (prefers-reduced-motion: reduce) {
-            *, *::before, *::after { animation: none !important; transition-duration: .01s !important; }
-        }
     </style>
 </head>
 <body>
@@ -413,7 +414,7 @@ HTML_TEMPLATE = """
     <header>
         <div class="brand">
             <div class="mark" aria-hidden="true">🧠</div>
-            <h1 class="logo-title">SVARA<span class="tag">Comprehensive Mind & Memory Assessment</span></h1>
+            <h1 class="logo-title">SVARA<span class="tag">Daily Life & Memory Assessment</span></h1>
         </div>
         <div class="right">
             <a class="home" href="https://svara-homepage.vercel.app">Home</a>
@@ -422,8 +423,8 @@ HTML_TEMPLATE = """
 
     <main class="main-container">
         <div class="header-box">
-            <h2>Dementia Stage Analysis</h2>
-            <p class="subtitle">Please complete these 18 easy daily living questions.</p>
+            <h2>Daily Life & Cognitive Assessment</h2>
+            <p class="subtitle">Please answer these 10 simple questions about daily routines and activities.</p>
         </div>
 
         <div id="errorBanner" class="error-banner"></div>
@@ -435,161 +436,86 @@ HTML_TEMPLATE = """
                 <input type="number" id="age" min="50" max="105" value="68" required>
             </div>
 
-            <div class="section-header">2. Memory & Word Recall</div>
+            <div class="section-header">2. Daily Routines & FAQs</div>
+
             <div class="form-card">
-                <label for="speech_find_words">2. Difficulty finding the right words or speaking smoothly?</label>
-                <select id="speech_find_words" required>
-                    <option value="0">No, speaking is normal</option>
-                    <option value="0.5">Mild difficulty (Occasional word pausing)</option>
-                    <option value="1">Frequent difficulty completing sentences</option>
+                <label for="daily_faq_memory_conversations">2. How often do you forget recent conversations or events that happened earlier in the day?</label>
+                <select id="daily_faq_memory_conversations" required>
+                    <option value="0">Rarely or Never (Normal memory)</option>
+                    <option value="0.5">Occasionally (Sometimes forget small details)</option>
+                    <option value="1">Frequently (Often forget whole conversations)</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="memory_recent_events">3. Forgetting recent events, conversations, or messages?</label>
-                <select id="memory_recent_events" required>
-                    <option value="0">No problem</option>
-                    <option value="0.5">Mild problem (Sometimes forget details)</option>
-                    <option value="1">Frequent problem forgetting recent events</option>
+                <label for="daily_faq_orientation_time_date">3. How often do you lose track of the date, month, or time of day?</label>
+                <select id="daily_faq_orientation_time_date" required>
+                    <option value="0">Never (Always aware of date/time)</option>
+                    <option value="0.5">Occasionally (Mix up dates briefly)</option>
+                    <option value="1">Frequently (Confused about time or day)</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="memory_repeat_questions">4. Repeating the same questions or stories in a single conversation?</label>
-                <select id="memory_repeat_questions" required>
-                    <option value="0">No repetition</option>
-                    <option value="0.5">Mild (Occasional repetition)</option>
-                    <option value="1">Frequent repetition</option>
-                </select>
-            </div>
-
-            <div class="section-header">3. Time & Orientation</div>
-            <div class="form-card">
-                <label for="orientation_date_time">5. Feeling confused about the day of the week, month, or time of day?</label>
-                <select id="orientation_date_time" required>
-                    <option value="0">No confusion</option>
-                    <option value="0.5">Mild (Occasionally mix up dates)</option>
-                    <option value="1">Frequent time/date confusion</option>
-                </select>
-            </div>
-
-            <div class="form-card">
-                <label for="orientation_familiar_places">6. Getting lost or confused in familiar places or neighborhoods?</label>
-                <select id="orientation_familiar_places" required>
-                    <option value="0">Never lost</option>
-                    <option value="0.5">Mild hesitation in places</option>
+                <label for="daily_faq_navigating_places">4. Do you experience hesitation or confusion when walking or driving in familiar neighborhoods?</label>
+                <select id="daily_faq_navigating_places" required>
+                    <option value="0">No, navigate easily</option>
+                    <option value="0.5">Mild hesitation in less frequent routes</option>
                     <option value="1">Frequent confusion in familiar places</option>
                 </select>
             </div>
 
-            <div class="section-header">4. Managing Chores & Tasks</div>
             <div class="form-card">
-                <label for="tasks_managing_money">7. Trouble managing bank accounts, cash, or paying bills?</label>
-                <select id="tasks_managing_money" required>
-                    <option value="0">No trouble</option>
-                    <option value="0.5">Mild trouble (Needs occasional help)</option>
-                    <option value="1">Significant difficulty managing money</option>
+                <label for="daily_faq_managing_finances">5. Do you find it challenging to manage daily bills, checkbook, or bank balance?</label>
+                <select id="daily_faq_managing_finances" required>
+                    <option value="0">No difficulty</option>
+                    <option value="0.5">Mild difficulty (Needs occasional review)</option>
+                    <option value="1">Significant trouble with routine finances</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="tasks_using_appliances">8. Difficulty operating household appliances (TV remote, stove, microwave)?</label>
-                <select id="tasks_using_appliances" required>
-                    <option value="0">Operates easily</option>
-                    <option value="0.5">Mild hesitation</option>
-                    <option value="1">Frequent trouble using appliances</option>
+                <label for="daily_faq_household_chores">6. How difficult is it to complete daily household tasks (e.g. using TV remote, cooking, appliance setup)?</label>
+                <select id="daily_faq_household_chores" required>
+                    <option value="0">Easy, no help needed</option>
+                    <option value="0.5">Occasional pauses or minor mistakes</option>
+                    <option value="1">Struggles with routine appliances or steps</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="tasks_cooking_meals">9. Trouble preparing or cooking regular meals safely?</label>
-                <select id="tasks_cooking_meals" required>
-                    <option value="0">Cooks normally</option>
-                    <option value="0.5">Mild difficulty with steps</option>
-                    <option value="1">Struggles to prepare meals</option>
-                </select>
-            </div>
-
-            <div class="section-header">5. Mood & Personality</div>
-            <div class="form-card">
-                <label for="mood_unmotivated_apathy">10. Loss of interest in hobbies, family activities, or daily routine?</label>
-                <select id="mood_unmotivated_apathy" required>
-                    <option value="0">Stays engaged</option>
-                    <option value="0.5">Mild lack of motivation</option>
-                    <option value="1">Significant loss of interest</option>
+                <label for="daily_faq_learning_new_tasks">7. Do you find it harder than usual to adapt to new tools, routines, or instructions?</label>
+                <select id="daily_faq_learning_new_tasks" required>
+                    <option value="0">Adapts easily</option>
+                    <option value="0.5">Takes extra time to learn new things</option>
+                    <option value="1">Avoids or struggles with new tasks</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="mood_anxiety_agitation">11. Uncharacteristic feelings of worry, restlessness, or irritability?</label>
-                <select id="mood_anxiety_agitation" required>
-                    <option value="0">No noticeable anxiety</option>
-                    <option value="0.5">Mild occasional worry</option>
-                    <option value="1">Frequent agitation or anxiety</option>
+                <label for="daily_faq_language_word_finding">8. How often do you struggle to find common words during regular conversations?</label>
+                <select id="daily_faq_language_word_finding" required>
+                    <option value="0">Rarely (Normal speech)</option>
+                    <option value="0.5">Occasional word pauses ("tip of the tongue")</option>
+                    <option value="1">Frequent pauses or losing train of thought</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="mood_personality_change">12. Noticeable changes in personality or social behavior?</label>
-                <select id="mood_personality_change" required>
-                    <option value="0">No change</option>
-                    <option value="0.5">Mild subtle changes</option>
-                    <option value="1">Clear personality changes</option>
-                </select>
-            </div>
-
-            <div class="section-header">6. Daily Routines & Safety</div>
-            <div class="form-card">
-                <label for="motor_misplacing_items">13. Misplacing items in unusual places (e.g. keys in the fridge)?</label>
-                <select id="motor_misplacing_items" required>
+                <label for="daily_faq_object_misplacement">9. How often do you misplace everyday objects in unusual locations (e.g., keys in the freezer)?</label>
+                <select id="daily_faq_object_misplacement" required>
                     <option value="0">Rarely or never</option>
-                    <option value="0.5">Occasional misplacement</option>
-                    <option value="1">Frequent misplacement in odd spots</option>
+                    <option value="0.5">Occasionally misplace items</option>
+                    <option value="1">Frequently leave items in odd places</option>
                 </select>
             </div>
 
             <div class="form-card">
-                <label for="motor_trouble_dressing">14. Trouble picking out clothing or dressing in proper order?</label>
-                <select id="motor_trouble_dressing" required>
-                    <option value="0">Dresses without help</option>
-                    <option value="0.5">Mild struggle with buttons/shoes</option>
-                    <option value="1">Needs assistance dressing</option>
-                </select>
-            </div>
-
-            <div class="form-card">
-                <label for="sleep_restlessness">15. Restless sleep or walking around during the night?</label>
-                <select id="sleep_restlessness" required>
-                    <option value="0">Sleeps well</option>
-                    <option value="0.5">Mild restlessness</option>
-                    <option value="1">Frequent nighttime awakening</option>
-                </select>
-            </div>
-
-            <div class="form-card">
-                <label for="social_withdrawal">16. Withdrawing from conversations or group social activities?</label>
-                <select id="social_withdrawal" required>
-                    <option value="0">Active socially</option>
-                    <option value="0.5">Mild quietness</option>
-                    <option value="1">Withdraws from conversations</option>
-                </select>
-            </div>
-
-            <div class="form-card">
-                <label for="safety_wandering">17. Wandering away or walking outside without knowing the destination?</label>
-                <select id="safety_wandering" required>
-                    <option value="0">Never happens</option>
-                    <option value="0.5">Occasional wandering tendency</option>
-                    <option value="1">Frequent wandering concern</option>
-                </select>
-            </div>
-
-            <div class="form-card">
-                <label for="judgment_poor_decisions">18. Making risky or unusually poor decisions (e.g. safety or scams)?</label>
-                <select id="judgment_poor_decisions" required>
-                    <option value="0">Normal judgment</option>
-                    <option value="0.5">Occasional minor lapses</option>
-                    <option value="1">Frequent poor decision making</option>
+                <label for="daily_faq_decision_making">10. Do family members notice changes in your daily decision-making or planning ability?</label>
+                <select id="daily_faq_decision_making" required>
+                    <option value="0">No changes noticed</option>
+                    <option value="0.5">Mild occasional lapses</option>
+                    <option value="1">Noticeable changes in judgment</option>
                 </select>
             </div>
 
@@ -615,23 +541,15 @@ HTML_TEMPLATE = """
 
         const payload = {
             age: parseFloat(document.getElementById('age').value),
-            speech_find_words: parseFloat(document.getElementById('speech_find_words').value),
-            memory_recent_events: parseFloat(document.getElementById('memory_recent_events').value),
-            memory_repeat_questions: parseFloat(document.getElementById('memory_repeat_questions').value),
-            orientation_date_time: parseFloat(document.getElementById('orientation_date_time').value),
-            orientation_familiar_places: parseFloat(document.getElementById('orientation_familiar_places').value),
-            tasks_managing_money: parseFloat(document.getElementById('tasks_managing_money').value),
-            tasks_using_appliances: parseFloat(document.getElementById('tasks_using_appliances').value),
-            tasks_cooking_meals: parseFloat(document.getElementById('tasks_cooking_meals').value),
-            mood_unmotivated_apathy: parseFloat(document.getElementById('mood_unmotivated_apathy').value),
-            mood_anxiety_agitation: parseFloat(document.getElementById('mood_anxiety_agitation').value),
-            mood_personality_change: parseFloat(document.getElementById('mood_personality_change').value),
-            motor_misplacing_items: parseFloat(document.getElementById('motor_misplacing_items').value),
-            motor_trouble_dressing: parseFloat(document.getElementById('motor_trouble_dressing').value),
-            sleep_restlessness: parseFloat(document.getElementById('sleep_restlessness').value),
-            social_withdrawal: parseFloat(document.getElementById('social_withdrawal').value),
-            safety_wandering: parseFloat(document.getElementById('safety_wandering').value),
-            judgment_poor_decisions: parseFloat(document.getElementById('judgment_poor_decisions').value)
+            daily_faq_memory_conversations: parseFloat(document.getElementById('daily_faq_memory_conversations').value),
+            daily_faq_orientation_time_date: parseFloat(document.getElementById('daily_faq_orientation_time_date').value),
+            daily_faq_navigating_places: parseFloat(document.getElementById('daily_faq_navigating_places').value),
+            daily_faq_managing_finances: parseFloat(document.getElementById('daily_faq_managing_finances').value),
+            daily_faq_household_chores: parseFloat(document.getElementById('daily_faq_household_chores').value),
+            daily_faq_learning_new_tasks: parseFloat(document.getElementById('daily_faq_learning_new_tasks').value),
+            daily_faq_language_word_finding: parseFloat(document.getElementById('daily_faq_language_word_finding').value),
+            daily_faq_object_misplacement: parseFloat(document.getElementById('daily_faq_object_misplacement').value),
+            daily_faq_decision_making: parseFloat(document.getElementById('daily_faq_decision_making').value)
         };
 
         if (isNaN(payload.age) || payload.age < 50 || payload.age > 105) {
@@ -676,7 +594,7 @@ HTML_TEMPLATE = """
 
 
 # ==============================================================================
-# 3. FLASK API ENDPOINTS WITH ERROR HANDLING & ZERO-SYMPTOM OVERRIDE
+# 3. FLASK API ENDPOINTS WITH ZERO-SYMPTOM OVERRIDE
 # ==============================================================================
 @app.route('/')
 def home():
@@ -692,7 +610,7 @@ def predict():
             float(data.get(feat, 0.0)) for feat in FEATURE_KEYS
         ]
 
-        # ERROR HANDLING / OVERRIDE RULE: If all symptom fields are 0
+        # Zero-symptom override rule: If all daily FAQ scores are 0
         symptom_values = input_vector[1:]  # Exclude age
         all_zeros = all(val == 0.0 for val in symptom_values)
 
@@ -701,10 +619,10 @@ def predict():
                 "stage": 0,
                 "stage_title": "🟢 You do not have dementia",
                 "severity": "None (All indicators are normal)",
-                "message": "All your reported symptom responses are normal (0). You do not have dementia. Keep maintaining your healthy daily lifestyle!"
+                "message": "All your reported responses are normal (0). You do not have dementia. Keep maintaining your healthy daily lifestyle!"
             })
 
-        # Predict Dementia Stage using the trained Pipeline Model
+        # Predict Dementia Stage using the pipeline model trained on real data
         predicted_stage = int(model.predict([input_vector])[0])
 
         stage_info = {
@@ -714,7 +632,7 @@ def predict():
                 "message": "Your answers indicate healthy cognitive and daily living functions. Keep enjoying your active lifestyle and daily routines!"
             },
             1: {
-                "stage_title": "🟡 Stage 1: Early Stage / Mild Cognitive Impairment",
+                "stage_title": "🟡 Stage 1: Very Mild / Early Cognitive Impairment",
                 "severity": "Mild Impairment",
                 "message": "Your answers suggest mild daily memory or recall changes. It is recommended to discuss these observations during your next routine family doctor check-up."
             },
@@ -746,5 +664,5 @@ def predict():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"Starting Multi-Stage Dementia Assessment Application on port {port}...")
+    print(f"Starting Real-Dataset Dementia Assessment Application on port {port}...")
     app.run(host='0.0.0.0', port=port)
