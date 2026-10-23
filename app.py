@@ -86,7 +86,7 @@ def load_or_train_model():
     X = df[FEATURE_KEYS]
     y = df['stage']
 
-    clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+    clf = RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42)
     clf.fit(X, y)
 
     # Save model locally for quick reuse
