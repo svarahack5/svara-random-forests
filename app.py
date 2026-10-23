@@ -4,13 +4,17 @@ import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
 
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. MODEL & DATASET MANAGEMENT
+# 1. MODEL & DATASET MANAGEMENT WITH PIPELINE
 # ==============================================================================
-MODEL_FILE = os.path.join(os.path.dirname(__file__), 'model.joblib')
+MODEL_FILE = os.path.join(os.path.dirname(__file__), 'model_pipeline.joblib')
 DATASET_FILE = 'dementia_multi_stage_dataset.csv'
 
 FEATURE_KEYS = [
@@ -36,24 +40,24 @@ def generate_multi_stage_dataset():
     df = pd.DataFrame(data)
 
     weighted_score = (
-            (df['age'] > 75).astype(int) * 1.5 +
-            df['speech_find_words'] * 1.5 +
-            df['memory_recent_events'] * 2.0 +
-            df['memory_repeat_questions'] * 1.5 +
-            df['orientation_date_time'] * 2.0 +
-            df['orientation_familiar_places'] * 2.5 +
-            df['tasks_managing_money'] * 2.0 +
-            df['tasks_using_appliances'] * 1.5 +
-            df['tasks_cooking_meals'] * 1.5 +
-            df['mood_unmotivated_apathy'] * 1.0 +
-            df['mood_anxiety_agitation'] * 1.0 +
-            df['mood_personality_change'] * 1.5 +
-            df['motor_misplacing_items'] * 1.0 +
-            df['motor_trouble_dressing'] * 2.5 +
-            df['sleep_restlessness'] * 1.0 +
-            df['social_withdrawal'] * 1.0 +
-            df['safety_wandering'] * 3.0 +
-            df['judgment_poor_decisions'] * 1.5
+        (df['age'] > 75).astype(int) * 1.5 +
+        df['speech_find_words'] * 1.5 +
+        df['memory_recent_events'] * 2.0 +
+        df['memory_repeat_questions'] * 1.5 +
+        df['orientation_date_time'] * 2.0 +
+        df['orientation_familiar_places'] * 2.5 +
+        df['tasks_managing_money'] * 2.0 +
+        df['tasks_using_appliances'] * 1.5 +
+        df['tasks_cooking_meals'] * 1.5 +
+        df['mood_unmotivated_apathy'] * 1.0 +
+        df['mood_anxiety_agitation'] * 1.0 +
+        df['mood_personality_change'] * 1.5 +
+        df['motor_misplacing_items'] * 1.0 +
+        df['motor_trouble_dressing'] * 2.5 +
+        df['sleep_restlessness'] * 1.0 +
+        df['social_withdrawal'] * 1.0 +
+        df['safety_wandering'] * 3.0 +
+        df['judgment_poor_decisions'] * 1.5
     )
 
     def calculate_stage(score):
@@ -72,12 +76,12 @@ def generate_multi_stage_dataset():
 
 
 def load_or_train_model():
-    """Loads a pre-trained joblib model if present; otherwise generates synthetic data and trains it."""
+    """Loads a pre-trained pipeline model if present; otherwise generates data, validates, and trains."""
     if os.path.exists(MODEL_FILE):
-        print(f"Loading existing model from {MODEL_FILE}...")
+        print(f"Loading existing model pipeline from {MODEL_FILE}...")
         return joblib.load(MODEL_FILE)
 
-    print("No joblib model found. Generating synthetic dataset and training model...")
+    print("No joblib model found. Generating synthetic dataset and training pipeline...")
     if not os.path.exists(DATASET_FILE):
         df = generate_multi_stage_dataset()
     else:
@@ -86,17 +90,36 @@ def load_or_train_model():
     X = df[FEATURE_KEYS]
     y = df['stage']
 
-    clf = RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42)
-    clf.fit(X, y)
+    # 1. Train-test split with stratification to prevent data leakage and evaluate safely
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
-    # Save model locally for quick reuse
+    # 2. Define Pipeline combining preprocessing and classifier
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42))
+    ])
+
+    # Train on training split
+    pipeline.fit(X_train, y_train)
+
+    # Evaluate on test split
+    y_pred = pipeline.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    print(f"Model Pipeline trained successfully! Test Accuracy: {acc * 100:.2f}%")
+
+    # Retrain on full dataset for production deployment
+    pipeline.fit(X, y)
+
+    # Save pipeline locally
     try:
-        joblib.dump(clf, MODEL_FILE)
-        print(f"Model saved to {MODEL_FILE}")
+        joblib.dump(pipeline, MODEL_FILE)
+        print(f"Model pipeline saved to {MODEL_FILE}")
     except Exception as e:
         print(f"Notice: Could not save model file locally ({e}). Continuing with in-memory model.")
 
-    return clf
+    return pipeline
 
 
 model = load_or_train_model()
@@ -141,7 +164,6 @@ HTML_TEMPLATE = """
             overflow-x: hidden;
         }
 
-        /* drifting aurora behind everything */
         body::before {
             content: "";
             position: fixed;
@@ -155,7 +177,6 @@ HTML_TEMPLATE = """
             animation: drift 22s ease-in-out infinite alternate;
         }
 
-        /* translucent header */
         header {
             position: sticky;
             top: 0; left: 0; right: 0;
@@ -683,7 +704,7 @@ def predict():
                 "message": "All your reported symptom responses are normal (0). You do not have dementia. Keep maintaining your healthy daily lifestyle!"
             })
 
-        # Predict Dementia Stage using Random Forest Model
+        # Predict Dementia Stage using the trained Pipeline Model
         predicted_stage = int(model.predict([input_vector])[0])
 
         stage_info = {
