@@ -12,10 +12,12 @@ from sklearn.metrics import accuracy_score
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. MODEL & DATASET MANAGEMENT (REAL DATASET + NON-CLINICAL FAQS)
+# 1. MODEL & DATASET MANAGEMENT (RELATIVE PATH FOR GITHUB DEPLOYMENT)
 # ==============================================================================
 MODEL_FILE = os.path.join(os.path.dirname(__file__), 'dementia_real_model.joblib')
-DATASET_FILE = 'dementia_dataset.csv'
+
+# Uses relative path relative to the app file for seamless running on GitHub / servers
+DATASET_FILE = os.path.join(os.path.dirname(__file__), 'dementia_dataset.csv')
 
 # Non-clinical feature keys corresponding to daily life FAQ inputs
 FEATURE_KEYS = [
@@ -35,7 +37,9 @@ FEATURE_KEYS = [
 def prepare_real_dataset():
     """Loads dementia_dataset.csv and maps clinical columns to non-clinical daily life FAQ proxies."""
     if not os.path.exists(DATASET_FILE):
-        raise FileNotFoundError(f"Dataset file '{DATASET_FILE}' not found. Please place it in the application directory.")
+        raise FileNotFoundError(
+            f"Dataset file '{DATASET_FILE}' not found. Please ensure 'dementia_dataset.csv' is in the root directory."
+        )
 
     raw_df = pd.read_csv(DATASET_FILE)
 
@@ -104,10 +108,10 @@ def load_or_train_model():
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # 2. Pipeline combining imputer and random forest classifier
+    # 2. Pipeline combining imputer and random forest classifier (n_estimators=500, max_depth=25)
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
-        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=15, random_state=42))
+        ('classifier', RandomForestClassifier(n_estimators=500, max_depth=25, random_state=42))
     ])
 
     # Train on training split only
@@ -664,5 +668,5 @@ def predict():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"Starting Real-Dataset Dementia Assessment Application on port {port}...")
+    print(f"Starting Svara Assessment Application on port {port}...")
     app.run(host='0.0.0.0', port=port)
